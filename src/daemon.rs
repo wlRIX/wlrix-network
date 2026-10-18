@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The main loop.
 //!
-//! Four sources on one calloop loop: "NetworkManager said something" from [`crate::nm::watch`],
-//! "a tray appeared" from [`crate::sni::watch_for_tray`], and the reload and quit pings from
-//! [`crate::signals`]. The loop owns the last snapshot and the config, and is the only thing that
-//! changes what the item shows.
+//! Five sources on one calloop loop: "NetworkManager said something" from [`crate::nm::watch`],
+//! "a tray appeared" from [`crate::sni::watch_for_tray`], what was chosen in the menu from
+//! [`crate::dbusmenu`], and the reload and quit pings from [`crate::signals`]. The loop owns the
+//! last snapshot and the config, is the only thing that changes what the item and its menu show,
+//! and is where NetworkManager is asked to do things.
+//!
+//! # Actions are fire and forget
+//!
+//! Joining a network, disconnecting and switching the radio are each one call, which
+//! NetworkManager answers as soon as it has *started*. What happens next -- connecting, failing,
+//! the radio coming up -- arrives as signals like any other change, and the icon and the menu
+//! follow it from there. Only a refusal (no permission, no such network) is reported here, as a
+//! notification, since nothing else would ever show it.
 //!
 //! # Letting a burst settle
 //!
@@ -14,13 +23,16 @@
 //! signal only *arms* a short timer, and the read happens when it fires. Signals that arrive while
 //! it is armed are already covered by the read to come.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use calloop::EventLoop;
 use calloop::timer::{TimeoutAction, Timer};
 
 use crate::config::Config;
+use crate::dbusmenu::MenuEvent;
 use crate::indicator::{self, Status, View};
+use crate::menu::{self, Action, Ids};
 use crate::nm::{self, Snapshot};
 use crate::sni::{self, Published};
 
@@ -28,6 +40,14 @@ use crate::sni::{self, Published};
 /// that the icon changes as the network does; long enough to cover the run of state changes a
 /// single connection attempt makes.
 const SETTLE: Duration = Duration::from_millis(250);
+
+/// The least time between scans asked for by opening the menu.
+///
+/// Not only politeness to NetworkManager, which refuses scans asked for too often anyway. A scan
+/// changes the menu, a changed menu makes the tray fetch it again, and fetching it sends
+/// `AboutToShow` -- so a scan on every `AboutToShow` would keep scanning for as long as the menu
+/// was open.
+const SCAN_COOLDOWN: Duration = Duration::from_secs(10);
 
 struct Daemon {
     config: Config,
@@ -40,6 +60,10 @@ struct Daemon {
     /// What the log last said was showing, so a line is written when that changes and not for
     /// every read.
     logged: Option<(String, Status)>,
+    /// The ids networks have in the menu; see [`crate::menu`].
+    ids: Ids,
+    /// When the menu last asked for a scan.
+    last_scan: Option<Instant>,
     exit: bool,
 }
 
@@ -63,6 +87,111 @@ impl Daemon {
         let view = self.view();
         self.log(&view);
         self.published.show(view);
+        let root = menu::build(self.snapshot.as_ref(), &mut self.ids);
+        self.published.set_menu(root);
+    }
+
+    fn on_menu(&mut self, event: MenuEvent) {
+        match event {
+            MenuEvent::Opening => self.scan(),
+            MenuEvent::Chosen(action) => self.act(action),
+        }
+    }
+
+    /// Ask every Wi-Fi device to scan, unless one was asked recently.
+    fn scan(&mut self) {
+        if self
+            .last_scan
+            .is_some_and(|last| last.elapsed() < SCAN_COOLDOWN)
+        {
+            return;
+        }
+        self.last_scan = Some(Instant::now());
+        for device in self.snapshot.iter().flat_map(|snapshot| &snapshot.wifi) {
+            nm::request_scan(&self.system, &device.path);
+        }
+    }
+
+    /// Do what a menu row says.
+    fn act(&mut self, action: Action) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let Some(device) = snapshot.primary() else {
+            return;
+        };
+        let result = match &action {
+            Action::Wireless(on) => nm::set_wireless(&self.system, *on),
+            Action::Disconnect => nm::disconnect(&self.system, &device.path),
+            Action::Join(ssid) => {
+                let current = device.access_point.as_ref().map(|ap| ap.ssid.as_str());
+                if current == Some(ssid.as_str()) {
+                    // Choosing the network already in use is choosing to stay on it.
+                    return;
+                }
+                if let Some(saved) = device.saved.iter().find(|saved| &saved.ssid == ssid) {
+                    nm::activate(&self.system, &saved.path, &device.path)
+                } else if let Some(network) =
+                    device.networks.iter().find(|network| &network.ssid == ssid)
+                {
+                    if network.enterprise {
+                        self.notify(
+                            &format!("{ssid} needs to be set up first"),
+                            "Enterprise networks take a username and certificates, which will \
+                             be set up in Network Settings. Until then, nm-connection-editor \
+                             or nmcli can add it.",
+                        );
+                        return;
+                    }
+                    if network.secured {
+                        // The password prompt is the next step. Until it exists, NetworkManager
+                        // would ask for the key, find nobody to ask, and fail with "no secrets".
+                        self.notify(
+                            &format!("{ssid} needs a password"),
+                            &format!(
+                                "Joining a secured network for the first time needs the password \
+                                 prompt, which is not finished yet. Join it once from a terminal \
+                                 with: nmcli --ask device wifi connect \"{ssid}\""
+                            ),
+                        );
+                        return;
+                    }
+                    nm::add_and_activate(&self.system, &device.path, &network.path)
+                } else {
+                    // Gone from the scan between the menu being drawn and the click.
+                    return;
+                }
+            }
+        };
+        if let Err(err) = result {
+            eprintln!("wlrix-network: {action:?} failed: {err}");
+            self.notify("Network change failed", &refusal(&err));
+        }
+    }
+
+    /// Post a notification. Not delivered is not reported beyond the log: the session's
+    /// notification daemon is the only place it could be shown.
+    fn notify(&self, summary: &str, body: &str) {
+        let hints: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
+        let actions: Vec<&str> = Vec::new();
+        if let Err(err) = self.published.connection().call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "Notify",
+            &(
+                "Network",
+                0u32,
+                "network-wireless-symbolic",
+                summary,
+                body,
+                actions,
+                hints,
+                -1i32,
+            ),
+        ) {
+            eprintln!("wlrix-network: could not post a notification ({err}): {summary}");
+        }
     }
 
     /// One line in the session log when what is shown changes, so "the icon said disconnected at
@@ -93,7 +222,10 @@ pub fn run() -> Result<(), String> {
         eprintln!("wlrix-network: NetworkManager is not on the system bus yet");
     }
     let first = indicator::view(snapshot.as_ref(), config.indicator);
-    let published = sni::publish(first.clone())?;
+    let mut ids = Ids::default();
+    let root = menu::build(snapshot.as_ref(), &mut ids);
+    let (menu_events, menu_channel) = calloop::channel::channel();
+    let published = sni::publish(first.clone(), root, menu_events)?;
 
     let mut event_loop: EventLoop<Daemon> =
         EventLoop::try_new().map_err(|err| format!("could not create the event loop: {err}"))?;
@@ -124,6 +256,14 @@ pub fn run() -> Result<(), String> {
             }
         })
         .map_err(|err| format!("could not listen to NetworkManager: {err}"))?;
+
+    handle
+        .insert_source(menu_channel, |event, _, daemon: &mut Daemon| {
+            if let calloop::channel::Event::Msg(event) = event {
+                daemon.on_menu(event);
+            }
+        })
+        .map_err(|err| format!("could not listen to the menu: {err}"))?;
 
     let (appeared, appearances) = calloop::channel::channel();
     sni::watch_for_tray(&published, appeared)?;
@@ -163,6 +303,8 @@ pub fn run() -> Result<(), String> {
         snapshot,
         settling: false,
         logged: None,
+        ids,
+        last_scan: None,
         exit: false,
     };
     daemon.log(&first);
@@ -214,4 +356,14 @@ pub fn status() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// What NetworkManager said when it refused, without the D-Bus error name in front -- "Not
+/// authorized to control networking." rather than "org.freedesktop.NetworkManager.PermissionDenied:
+/// Not authorized to control networking."
+fn refusal(err: &zbus::Error) -> String {
+    match err {
+        zbus::Error::MethodError(_, Some(description), _) => description.clone(),
+        other => other.to_string(),
+    }
 }

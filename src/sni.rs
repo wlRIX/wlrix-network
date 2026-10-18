@@ -2,7 +2,7 @@
 //! The Wi-Fi icon, as a StatusNotifierItem on the session bus.
 //!
 //! The tray is `org.kde.StatusNotifierWatcher`; this registers an item with it and the tray draws
-//! it, its tooltip and -- in a later step -- its menu. Registered **KDE-style**, by bus name, with
+//! it, its tooltip and its menu ([`crate::dbusmenu`]). Registered **KDE-style**, by bus name, with
 //! the item at `/StatusNotifierItem`: the form fcitx5 uses and the tray's first-class path.
 //!
 //! # Changes
@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use zbus::MatchRule;
 use zbus::message::Type;
 
+use crate::dbusmenu::{Layout, MENU_PATH, Menu, MenuEvent};
 use crate::indicator::View;
+use crate::menu::Row;
 
 /// Where the item is served.
 pub const ITEM_PATH: &str = "/StatusNotifierItem";
@@ -52,11 +54,9 @@ impl Item {
 
 #[zbus::interface(name = "org.kde.StatusNotifierItem")]
 impl Item {
-    /// A left click. Nothing yet: the menu of networks is the next step, and it will open from
-    /// here. Logged so a click can be seen to arrive.
-    fn activate(&self, _x: i32, _y: i32) {
-        eprintln!("wlrix-network: Activate (the network menu is not there yet)");
-    }
+    /// Never called by a tray that honors `ItemIsMenu`, which opens the menu instead. Another
+    /// desktop's tray may call it anyway, and there is nothing else for a click to do.
+    fn activate(&self, _x: i32, _y: i32) {}
 
     fn secondary_activate(&self, _x: i32, _y: i32) {}
 
@@ -100,9 +100,16 @@ impl Item {
         String::new()
     }
 
+    /// A click opens the menu: the item has no other action, and saying so is what makes the
+    /// tray open it on a left click rather than only a right one.
     #[zbus(property)]
     fn item_is_menu(&self) -> bool {
-        false
+        true
+    }
+
+    #[zbus(property)]
+    fn menu(&self) -> zbus::zvariant::ObjectPath<'static> {
+        zbus::zvariant::ObjectPath::from_static_str_unchecked(MENU_PATH)
     }
 
     /// `(sa(iiay)ss)`: icon name, icon pixmaps, title, body.
@@ -117,6 +124,7 @@ impl Item {
 pub struct Published {
     connection: zbus::blocking::Connection,
     view: Arc<Mutex<View>>,
+    layout: Arc<Mutex<Layout>>,
     /// The bus name the item registers under.
     name: String,
 }
@@ -162,6 +170,16 @@ impl Published {
         }
     }
 
+    /// Replace the menu, telling the tray if it changed.
+    pub fn set_menu(&self, root: Row) {
+        crate::dbusmenu::update(&self.connection, &self.layout, root);
+    }
+
+    /// The session bus, for the notifications a failed action posts.
+    pub fn connection(&self) -> &zbus::blocking::Connection {
+        &self.connection
+    }
+
     /// Register with the tray. No tray is not an error: [`watch_for_tray`] registers again when
     /// one appears.
     pub fn register(&self) {
@@ -178,9 +196,14 @@ impl Published {
     }
 }
 
-/// Serve the item and take a bus name for it. Nothing is registered yet.
-pub fn publish(view: View) -> Result<Published, String> {
+/// Serve the item and its menu, and take a bus name for them. Nothing is registered yet.
+pub fn publish(
+    view: View,
+    root: Row,
+    events: calloop::channel::Sender<MenuEvent>,
+) -> Result<Published, String> {
     let view = Arc::new(Mutex::new(view));
+    let layout = Arc::new(Mutex::new(Layout { root, revision: 1 }));
     let connection = zbus::blocking::connection::Builder::session()
         .map_err(|err| format!("no session bus: {err}"))?
         .serve_at(
@@ -190,6 +213,14 @@ pub fn publish(view: View) -> Result<Published, String> {
             },
         )
         .map_err(|err| format!("could not serve the item: {err}"))?
+        .serve_at(
+            MENU_PATH,
+            Menu {
+                layout: Arc::clone(&layout),
+                events,
+            },
+        )
+        .map_err(|err| format!("could not serve the menu: {err}"))?
         .build()
         .map_err(|err| format!("could not connect to the session bus: {err}"))?;
     // The specification's naming convention, which the tray does not need -- it talks to the
@@ -201,6 +232,7 @@ pub fn publish(view: View) -> Result<Published, String> {
     Ok(Published {
         connection,
         view,
+        layout,
         name,
     })
 }

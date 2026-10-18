@@ -21,7 +21,7 @@
 //! wired indicator: a machine on a cable shows nothing, which is what a desktop wants.
 
 use crate::config::Indicator;
-use crate::nm::{Connectivity, DeviceState, Snapshot};
+use crate::nm::{Connectivity, DeviceState, Mode, Snapshot};
 
 /// `Status`, as the StatusNotifierItem specification spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +58,8 @@ const OFFLINE: &str = "network-wireless-offline-symbolic";
 const ACQUIRING: &str = "network-wireless-acquiring-symbolic";
 /// Connected, but NetworkManager's check says the internet is not reachable.
 const NO_ROUTE: &str = "network-wireless-no-route-symbolic";
+/// Sharing this computer's connection as a network of its own.
+const HOTSPOT: &str = "network-wireless-hotspot-symbolic";
 
 /// The bars for a signal strength, in GNOME's buckets.
 fn signal(strength: u8) -> &'static str {
@@ -109,6 +111,16 @@ pub fn view(snapshot: Option<&Snapshot>, setting: Indicator) -> View {
     }
 
     let ssid = device.access_point.as_ref().map(|ap| ap.ssid.clone());
+    if device.mode == Mode::Hotspot && device.state == DeviceState::Connected {
+        return view(
+            HOTSPOT,
+            match ssid {
+                Some(ssid) => format!("Hotspot: {ssid}"),
+                None => "Hotspot".into(),
+            },
+            vec!["Sharing this computer's connection".into()],
+        );
+    }
     match device.state {
         DeviceState::Connected => {
             let Some(ap) = device.access_point.as_ref() else {
@@ -162,8 +174,12 @@ mod tests {
             hardware_enabled: true,
             connectivity: Connectivity::Full,
             wifi: vec![WifiDevice {
+                path: "/dev/wlan0".into(),
+                saved: Vec::new(),
+                networks: Vec::new(),
                 interface: "wlan0".into(),
                 state,
+                mode: Mode::Client,
                 access_point: Some(AccessPoint {
                     ssid: "HomeNet".into(),
                     strength,
@@ -253,6 +269,15 @@ mod tests {
 
         off.hardware_enabled = false;
         assert_eq!(view(Some(&off), Indicator::Auto).icon, HARDWARE_DISABLED);
+    }
+
+    #[test]
+    fn a_hotspot_on_its_own_says_it_is_one() {
+        let mut sharing = snapshot(DeviceState::Connected, 0);
+        sharing.wifi[0].mode = Mode::Hotspot;
+        let shown = view(Some(&sharing), Indicator::Auto);
+        assert_eq!(shown.icon, HOTSPOT);
+        assert_eq!(shown.title, "Hotspot: HomeNet");
     }
 
     #[test]

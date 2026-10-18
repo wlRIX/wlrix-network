@@ -1,14 +1,15 @@
 # wlrix-network
 
 Network status for the wlRIX desktop: NetworkManager's Wi-Fi state, as an icon in `wlrix-tray`. Bars of signal while
-connected, a tooltip naming the network and its address, and nothing at all on a machine with no wireless device.
+connected, a tooltip naming the network and its address, a menu of nearby networks to join, and nothing at all on a
+machine with no wireless device.
 
 - **Language:** Rust
 - **License:** GPL-3.0-or-later
 
 IRIX was a workstation operating system and never had to say which network it was on. This is one of the pieces that
-makes wlRIX usable on a laptop. It is step one of `_docs/wlrix-network-roadmap.md` in the workspace, and it is
-**read-only**: the menu of nearby networks, the password prompt and the Network Settings panel are later steps.
+makes wlRIX usable on a laptop. Steps one and two of `_docs/wlrix-network-roadmap.md` in the workspace are done: the
+icon, and the menu. The password prompt and the Network Settings panel are later steps.
 
 ## What it is
 
@@ -66,8 +67,43 @@ radio:   on (hardware switch on)
 device:  wlan0 Connected
 ```
 
-A click on the icon does nothing yet; the menu of networks will open from there. The item's `Id` is `wlrix-network`,
-for ordering or hiding it with `[[item]]` in `tray.toml`.
+The item's `Id` is `wlrix-network`, for ordering or hiding it with `[[item]]` in `tray.toml`.
+
+## The menu
+
+A click on the icon opens it, drawn by the tray as a 4Dwm menu:
+
+```text
+Wi-Fi: Connected to HomeNet
+[x] Wireless Enabled
+-------------------------
+(*) HomeNet       ▂▄▆
+( ) Neighbor-5G   ▂▄▆█
+( ) CoffeeShop    ▂   (open)
+More Networks            >
+-------------------------
+Disconnect
+```
+
+- **Opening it scans**, at most every ten seconds, and networks the scan finds appear in the open menu.
+- **The network in use comes first**, then the ones NetworkManager has saved, then the rest, each strongest first.
+  One row per network name, however many access points broadcast it. Eight at the top; the rest under More Networks.
+- **Choosing a saved network** joins it through the device's own `AvailableConnections` -- NetworkManager's list of
+  profiles that work on that device, so a hotspot's profile or one tied to another interface is never mistaken for a
+  way to join. **Choosing an open network** creates a connection for it. **A secured one not yet saved** posts a
+  notification instead, with the `nmcli` command to join it once: the password prompt is the next step, and without
+  it NetworkManager would only fail asking for a key. Enterprise networks likewise.
+- **Wireless Enabled** is the software radio switch, grayed out when the hardware switch is off. **Disconnect** takes
+  the device off its network; on a machine sharing a hotspot it reads **Stop Hotspot**.
+- A refusal -- no permission, a profile NetworkManager will not use -- is a notification, since nothing else would ever
+  show it. Everything after a successful start arrives as NetworkManager signals and moves the icon and the menu.
+
+Row ids stay with a network for as long as the daemon runs, so a click that arrives after a scan has reordered the list
+still joins the network that was clicked. Network names have their `_` doubled on the wire, since dbusmenu reads a
+single one as a mnemonic.
+
+The menu is `com.canonical.dbusmenu` at `/MenuBar`, and all of it is served -- `GetGroupProperties`, `EventGroup` and the
+rest -- so it works from another desktop's tray as well.
 
 ## How it stays current
 
@@ -93,10 +129,21 @@ property maps -- device states, access-point security flags, SSIDs that are not 
 $ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --all --check
 ```
 
-A machine with no Wi-Fi can still test the connected states with virtual radios: `mac80211_hwsim` creates them, and
-`hostapd` on one makes an access point the other can join.
+A machine with no Wi-Fi can still test everything with virtual radios. `mac80211_hwsim` creates them, and
+NetworkManager can make one of them an access point for the other:
 
 ```console
 $ sudo modprobe mac80211_hwsim radios=2
+$ nmcli connection add type wifi ifname wlan1 con-name test-open autoconnect no ssid test_open \
+      802-11-wireless.mode ap ipv4.method shared ipv6.method disabled
+$ nmcli connection up test-open
+$ nmcli device wifi hotspot ifname wlan1 con-name test-wpa ssid test_wpa password testpass123
 $ wlrix-network --status
 ```
+
+Shared mode's DHCP may not answer between virtual radios, leaving the client at "getting IP configuration"; giving the
+client's profile a static `10.42.0.x/24` address gets it to connected. Delete the test profiles afterwards.
+
+The menu can be driven without a pointer: `busctl --user call <item name> /MenuBar com.canonical.dbusmenu GetLayout iias
+-- 0 -1 0` lists the rows, and `Event isvu <id> clicked i 0 0` chooses one. Run that on a private bus
+(`env -u WAYLAND_DISPLAY dbus-run-session`) so the live session's tray and notifications are not involved.

@@ -16,14 +16,15 @@
 //!
 //! # What is read
 //!
-//! Only what the indicator shows. Step 1 is read-only: no scan list, no saved connections, and
+//! What the indicator and the menu show: the radio, each Wi-Fi device's state, the network it is
+//! on and what its last scan found, and the saved connections it could use. Nothing else of
 //! nothing written. Those come with the menu.
 
 use std::collections::HashMap;
 
 use zbus::MatchRule;
 use zbus::message::Type;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 /// NetworkManager's bus name and root object.
 pub const NAME: &str = "org.freedesktop.NetworkManager";
@@ -32,11 +33,17 @@ const DEVICE: &str = "org.freedesktop.NetworkManager.Device";
 const WIRELESS: &str = "org.freedesktop.NetworkManager.Device.Wireless";
 const ACCESS_POINT: &str = "org.freedesktop.NetworkManager.AccessPoint";
 const IP4_CONFIG: &str = "org.freedesktop.NetworkManager.IP4Config";
+const SETTINGS_CONNECTION: &str = "org.freedesktop.NetworkManager.Settings.Connection";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const DBUS: &str = "org.freedesktop.DBus";
 
 /// `NM_DEVICE_TYPE_WIFI`.
 const DEVICE_TYPE_WIFI: u32 = 2;
+/// `NM_802_11_AP_FLAGS_PRIVACY`: WEP, or a key of some kind.
+const AP_PRIVACY: u32 = 0x1;
+/// `NM_802_11_AP_SEC_KEY_MGMT_802_1X`: enterprise Wi-Fi, a username and a certificate rather than
+/// a password.
+const KEY_MGMT_802_1X: u32 = 0x200;
 
 /// Where a device is, from `NMDeviceState`, folded into what the indicator distinguishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,14 +112,70 @@ pub struct AccessPoint {
     pub secured: bool,
 }
 
+/// One network in range, as the menu lists it: every access point broadcasting the same name
+/// folded into one, the strongest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Network {
+    pub ssid: String,
+    pub strength: u8,
+    pub secured: bool,
+    /// 802.1X. Set up in Network Settings rather than from a menu.
+    pub enterprise: bool,
+    /// The strongest access point's object, which is what NetworkManager is asked to join.
+    pub path: String,
+}
+
+/// A saved Wi-Fi connection -- a network NetworkManager knows how to join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
+    pub ssid: String,
+    /// Its object under `Settings`, which is what `ActivateConnection` takes.
+    pub path: String,
+}
+
+/// What a Wi-Fi device is doing with its radio, from `NM80211Mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Joined to someone else's network, or trying to be -- the ordinary case.
+    #[default]
+    Client,
+    /// Being the network: a hotspot sharing this computer's connection.
+    Hotspot,
+}
+
+impl Mode {
+    /// `NM_802_11_MODE_AP` is 3. Ad-hoc and mesh are read as client, which is what they look like
+    /// from a menu.
+    fn from_code(code: u32) -> Self {
+        if code == 3 {
+            Self::Hotspot
+        } else {
+            Self::Client
+        }
+    }
+}
+
 /// One Wi-Fi device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WifiDevice {
+    /// Its object, which actions are addressed to.
+    pub path: String,
     pub interface: String,
     pub state: DeviceState,
+    pub mode: Mode,
     pub access_point: Option<AccessPoint>,
     /// The first IPv4 address, as `address/prefix`.
     pub ipv4: Option<String>,
+    /// What the last scan found, strongest first. Hidden networks, which broadcast no name, are
+    /// left out: there is nothing to list them as.
+    pub networks: Vec<Network>,
+    /// The saved Wi-Fi connections this device can use.
+    ///
+    /// NetworkManager's own answer -- the device's `AvailableConnections` -- rather than every
+    /// saved Wi-Fi connection matched up by name. A profile tied to another interface, or one that
+    /// makes a hotspot rather than joining one, shares a network's name and still cannot join it
+    /// from here; trying fails with "profile is not compatible with device".
+    pub saved: Vec<Saved>,
 }
 
 /// Everything the indicator is drawn from.
@@ -131,10 +194,15 @@ impl Snapshot {
     /// The device the indicator describes: the connected one if any, then one on its way to
     /// being connected, then the first. A machine with two radios is rare, and one of them in use
     /// is what a person wants to know about.
+    ///
+    /// A hotspot comes last. NetworkManager calls a device sharing a hotspot "activated", and
+    /// ranked by state alone it would be described as connected to its own network -- at no
+    /// signal at all, since there is no access point but itself.
     pub fn primary(&self) -> Option<&WifiDevice> {
-        let rank = |device: &&WifiDevice| match device.state {
-            DeviceState::Connected => 0,
-            DeviceState::Connecting => 1,
+        let rank = |device: &&WifiDevice| match (device.mode, device.state) {
+            (Mode::Hotspot, _) => 3,
+            (_, DeviceState::Connected) => 0,
+            (_, DeviceState::Connecting) => 1,
             _ => 2,
         };
         self.wifi.iter().min_by_key(rank)
@@ -161,6 +229,7 @@ pub fn read(connection: &zbus::blocking::Connection) -> zbus::Result<Snapshot> {
             continue;
         };
         let state = DeviceState::from_code(take(&device, "State").unwrap_or(0));
+        let mode = Mode::from_code(get(connection, path.as_str(), WIRELESS, "Mode").unwrap_or(2));
         let access_point =
             get::<OwnedObjectPath>(connection, path.as_str(), WIRELESS, "ActiveAccessPoint")
                 .ok()
@@ -179,11 +248,27 @@ pub fn read(connection: &zbus::blocking::Connection) -> zbus::Result<Snapshot> {
                 .ok()
             })
             .and_then(|addresses| first_address(&addresses));
+        let scanned: Vec<(String, HashMap<String, OwnedValue>)> =
+            get::<Vec<OwnedObjectPath>>(connection, path.as_str(), WIRELESS, "AccessPoints")
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|ap| {
+                    let properties = get_all(connection, ap.as_str(), ACCESS_POINT).ok()?;
+                    Some((ap.to_string(), properties))
+                })
+                .collect();
         wifi.push(WifiDevice {
+            path: path.to_string(),
             interface: take(&device, "Interface").unwrap_or_default(),
             state,
+            mode,
             access_point,
             ipv4,
+            networks: networks(&scanned),
+            saved: saved_connections(
+                connection,
+                &take::<Vec<OwnedObjectPath>>(&device, "AvailableConnections").unwrap_or_default(),
+            ),
         });
     }
 
@@ -195,6 +280,165 @@ pub fn read(connection: &zbus::blocking::Connection) -> zbus::Result<Snapshot> {
     })
 }
 
+/// Fold a scan into one entry per network name, strongest first.
+///
+/// A home with a mesh, an office, a campus: one name, many access points. Listing each would put
+/// the same network in the menu five times, and choosing between them is NetworkManager's job --
+/// it roams between them on its own. The strongest one's properties stand for the network.
+fn networks(scanned: &[(String, HashMap<String, OwnedValue>)]) -> Vec<Network> {
+    let mut best: HashMap<String, Network> = HashMap::new();
+    for (path, properties) in scanned {
+        let ssid: Vec<u8> = take(properties, "Ssid").unwrap_or_default();
+        if ssid.iter().all(|&byte| byte == 0) {
+            continue;
+        }
+        let point = access_point(properties);
+        let flag = |name: &str| take::<u32>(properties, name).unwrap_or(0);
+        let network = Network {
+            ssid: point.ssid,
+            strength: point.strength,
+            secured: point.secured,
+            enterprise: (flag("WpaFlags") | flag("RsnFlags")) & KEY_MGMT_802_1X != 0,
+            path: path.clone(),
+        };
+        match best.get(&network.ssid) {
+            Some(kept) if kept.strength >= network.strength => {}
+            _ => {
+                best.insert(network.ssid.clone(), network);
+            }
+        }
+    }
+    let mut list: Vec<Network> = best.into_values().collect();
+    list.sort_by(|a, b| {
+        b.strength
+            .cmp(&a.strength)
+            .then_with(|| a.ssid.cmp(&b.ssid))
+    });
+    list
+}
+
+/// The Wi-Fi connections among `paths` that join a network.
+///
+/// One `GetSettings` each. Secrets are never returned by that call, which is as it should be:
+/// nothing here needs them.
+fn saved_connections(
+    connection: &zbus::blocking::Connection,
+    paths: &[OwnedObjectPath],
+) -> Vec<Saved> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let reply = connection
+                .call_method(
+                    Some(NAME),
+                    path.as_str(),
+                    Some(SETTINGS_CONNECTION),
+                    "GetSettings",
+                    &(),
+                )
+                .ok()?;
+            let settings: HashMap<String, HashMap<String, OwnedValue>> =
+                reply.body().deserialize().ok()?;
+            saved_wifi(&settings).map(|ssid| Saved {
+                ssid,
+                path: path.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The network a saved connection joins, if it is a Wi-Fi connection that joins one. A hotspot's
+/// profile names its network too, and "joining" through it would start a hotspot instead.
+fn saved_wifi(settings: &HashMap<String, HashMap<String, OwnedValue>>) -> Option<String> {
+    let kind: String = take(settings.get("connection")?, "type")?;
+    if kind != "802-11-wireless" {
+        return None;
+    }
+    let wireless = settings.get("802-11-wireless")?;
+    let mode: String = take(wireless, "mode").unwrap_or_default();
+    if mode == "ap" || mode == "adhoc" || mode == "mesh" {
+        return None;
+    }
+    let ssid: Vec<u8> = take(wireless, "ssid")?;
+    Some(ssid_text(&ssid))
+}
+
+/// Turn the software radio switch on or off -- what `nmcli radio wifi` does.
+///
+/// Allowed for the active local session by NetworkManager's default polkit policy; a stricter
+/// policy brings up the polkit agent.
+pub fn set_wireless(connection: &zbus::blocking::Connection, on: bool) -> zbus::Result<()> {
+    connection.call_method(
+        Some(NAME),
+        ROOT,
+        Some(PROPERTIES),
+        "Set",
+        &(NAME, "WirelessEnabled", Value::from(on)),
+    )?;
+    Ok(())
+}
+
+/// Join a network through a saved connection. `"/"` for the specific object lets NetworkManager
+/// pick the access point, which is what roaming needs.
+pub fn activate(
+    connection: &zbus::blocking::Connection,
+    saved: &str,
+    device: &str,
+) -> zbus::Result<()> {
+    let object = |path: &str| ObjectPath::try_from(path.to_owned()).map_err(zbus::Error::from);
+    connection.call_method(
+        Some(NAME),
+        ROOT,
+        Some(NAME),
+        "ActivateConnection",
+        &(object(saved)?, object(device)?, object("/")?),
+    )?;
+    Ok(())
+}
+
+/// Join a network NetworkManager has no connection for, creating one.
+///
+/// The settings are left empty and the access point is named: NetworkManager fills in the rest
+/// from what the access point advertises, which for an open network is everything. Where the new
+/// connection is stored, and who may use it, is decided with the password prompt in the next
+/// step -- until then NetworkManager's default, system-wide, applies.
+pub fn add_and_activate(
+    connection: &zbus::blocking::Connection,
+    device: &str,
+    access_point: &str,
+) -> zbus::Result<()> {
+    let object = |path: &str| ObjectPath::try_from(path.to_owned()).map_err(zbus::Error::from);
+    let settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
+    connection.call_method(
+        Some(NAME),
+        ROOT,
+        Some(NAME),
+        "AddAndActivateConnection",
+        &(settings, object(device)?, object(access_point)?),
+    )?;
+    Ok(())
+}
+
+/// Take a device off whatever network it is on. NetworkManager will not autoconnect it again
+/// until something asks it to, which is what "Disconnect" in a menu means.
+pub fn disconnect(connection: &zbus::blocking::Connection, device: &str) -> zbus::Result<()> {
+    connection.call_method(Some(NAME), device, Some(DEVICE), "Disconnect", &())?;
+    Ok(())
+}
+
+/// Ask a device to scan. NetworkManager refuses a scan asked for too soon after the last, which is
+/// not worth reporting: the last scan's results are still there.
+pub fn request_scan(connection: &zbus::blocking::Connection, device: &str) {
+    let options: HashMap<&str, Value> = HashMap::new();
+    let _ = connection.call_method(
+        Some(NAME),
+        device,
+        Some(WIRELESS),
+        "RequestScan",
+        &(options,),
+    );
+}
+
 /// An access point's properties, read into what is shown.
 fn access_point(properties: &HashMap<String, OwnedValue>) -> AccessPoint {
     let ssid: Vec<u8> = take(properties, "Ssid").unwrap_or_default();
@@ -203,7 +447,7 @@ fn access_point(properties: &HashMap<String, OwnedValue>) -> AccessPoint {
         ssid: ssid_text(&ssid),
         strength: take::<u8>(properties, "Strength").unwrap_or(0).min(100),
         // Privacy (WEP) in `Flags`, or any WPA/RSN key management at all.
-        secured: flag("Flags") & 0x1 != 0 || flag("WpaFlags") != 0 || flag("RsnFlags") != 0,
+        secured: flag("Flags") & AP_PRIVACY != 0 || flag("WpaFlags") != 0 || flag("RsnFlags") != 0,
     }
 }
 
@@ -268,25 +512,18 @@ where
     T::try_from(value).map_err(Into::into)
 }
 
-/// Ask the bus for every signal that can change what the indicator shows: property changes on
-/// NetworkManager's objects, its own signals (`DeviceAdded`, `DeviceRemoved`, `StateChanged`),
-/// and its name coming and going, which is what a restart of NetworkManager looks like.
+/// Ask the bus for every signal that can change what the indicator or the menu shows: every
+/// signal NetworkManager sends under its root -- property changes on any of its objects,
+/// `DeviceAdded` and friends, a scan's `AccessPointAdded`, a saved connection's `Updated` and
+/// `Removed` -- and its name coming and going, which is what a restart of NetworkManager looks
+/// like.
 pub fn subscribe(connection: &zbus::blocking::Connection) -> zbus::Result<()> {
     let bus = zbus::blocking::fdo::DBusProxy::new(connection)?;
     bus.add_match_rule(
         MatchRule::builder()
             .msg_type(Type::Signal)
             .sender(NAME)?
-            .interface(PROPERTIES)?
-            .member("PropertiesChanged")?
             .path_namespace(ROOT)?
-            .build(),
-    )?;
-    bus.add_match_rule(
-        MatchRule::builder()
-            .msg_type(Type::Signal)
-            .sender(NAME)?
-            .interface(NAME)?
             .build(),
     )?;
     bus.add_match_rule(
@@ -330,7 +567,7 @@ pub fn watch(
 
 /// A value in a test property map.
 #[cfg(test)]
-fn owned<'a>(value: impl Into<zbus::zvariant::Value<'a>>) -> OwnedValue {
+fn owned<'a>(value: impl Into<Value<'a>>) -> OwnedValue {
     value.into().try_into().unwrap()
 }
 
@@ -402,13 +639,97 @@ mod tests {
         assert_eq!(first_address(&[]), None);
     }
 
+    fn scanned(
+        ssid: &[u8],
+        strength: u8,
+        rsn: u32,
+        path: &str,
+    ) -> (String, HashMap<String, OwnedValue>) {
+        let mut properties = HashMap::new();
+        properties.insert("Ssid".to_owned(), owned(ssid.to_vec()));
+        properties.insert("Strength".to_owned(), owned(strength));
+        properties.insert(
+            "Flags".to_owned(),
+            owned(if rsn != 0 { AP_PRIVACY } else { 0 }),
+        );
+        properties.insert("WpaFlags".to_owned(), owned(0u32));
+        properties.insert("RsnFlags".to_owned(), owned(rsn));
+        (path.to_owned(), properties)
+    }
+
+    #[test]
+    fn a_scan_folds_into_one_entry_per_name_strongest_first() {
+        let list = networks(&[
+            scanned(b"Mesh", 40, 0x188, "/ap/1"),
+            scanned(b"Cafe", 55, 0, "/ap/2"),
+            scanned(b"Mesh", 80, 0x188, "/ap/3"),
+            scanned(b"", 99, 0, "/ap/4"),
+            scanned(b"Campus", 30, 0x200 | 0x100, "/ap/5"),
+        ]);
+        let names: Vec<&str> = list.iter().map(|n| n.ssid.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Mesh", "Cafe", "Campus"],
+            "the hidden one is left out"
+        );
+        assert_eq!(
+            list[0].path, "/ap/3",
+            "the strongest access point stands for the network"
+        );
+        assert!(list[0].secured && !list[0].enterprise);
+        assert!(!list[1].secured);
+        assert!(list[2].enterprise);
+    }
+
+    #[test]
+    fn only_wifi_connections_are_saved_networks() {
+        let section = |pairs: Vec<(&str, OwnedValue)>| {
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect::<HashMap<_, _>>()
+        };
+        let mut wifi = HashMap::new();
+        wifi.insert(
+            "connection".to_owned(),
+            section(vec![("type", owned("802-11-wireless"))]),
+        );
+        wifi.insert(
+            "802-11-wireless".to_owned(),
+            section(vec![("ssid", owned(b"HomeNet".to_vec()))]),
+        );
+        assert_eq!(saved_wifi(&wifi).as_deref(), Some("HomeNet"));
+
+        let mut wired = HashMap::new();
+        wired.insert(
+            "connection".to_owned(),
+            section(vec![("type", owned("802-3-ethernet"))]),
+        );
+        assert_eq!(saved_wifi(&wired), None);
+
+        // A hotspot's profile has the network's name and is not a way to join it.
+        let mut hotspot = wifi.clone();
+        hotspot.insert(
+            "802-11-wireless".to_owned(),
+            section(vec![
+                ("ssid", owned(b"HomeNet".to_vec())),
+                ("mode", owned("ap")),
+            ]),
+        );
+        assert_eq!(saved_wifi(&hotspot), None);
+    }
+
     #[test]
     fn the_connected_radio_is_the_one_described() {
         let device = |interface: &str, state| WifiDevice {
+            path: String::new(),
             interface: interface.into(),
             state,
+            mode: Mode::Client,
             access_point: None,
             ipv4: None,
+            networks: Vec::new(),
+            saved: Vec::new(),
         };
         let snapshot = Snapshot {
             wifi: vec![
@@ -419,5 +740,15 @@ mod tests {
         };
         assert_eq!(snapshot.primary().unwrap().interface, "wlan1");
         assert!(Snapshot::default().primary().is_none());
+
+        // A connected hotspot loses to a disconnected client: the client is what can be joined to
+        // something.
+        let mut hotspot = device("wlan1", DeviceState::Connected);
+        hotspot.mode = Mode::Hotspot;
+        let sharing = Snapshot {
+            wifi: vec![hotspot, device("wlan0", DeviceState::Disconnected)],
+            ..Snapshot::default()
+        };
+        assert_eq!(sharing.primary().unwrap().interface, "wlan0");
     }
 }
