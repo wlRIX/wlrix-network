@@ -12,6 +12,8 @@
 //! ---------------------------------
 //! Join Other Network...
 //! Disconnect
+//! ---------------------------------
+//! Network Settings...
 //! ```
 //!
 //! The tray draws it -- as a 4Dwm menu, from `com.canonical.dbusmenu`, which [`crate::dbusmenu`]
@@ -25,10 +27,8 @@
 //! for as long as the daemon runs ([`Ids`]), and the fixed rows have fixed ids: an id always
 //! means the same thing, and a click on a row that has since gone is simply ignored.
 //!
-//! # What is not here yet
-//!
-//! "Network Settings..." comes with the settings panel. A row that does nothing would be worse
-//! than no row.
+//! The last row, under every state of the radio, opens Network Settings
+//! (`wlrix-settings-network`), where the saved networks are looked after.
 
 use std::collections::HashMap;
 
@@ -44,6 +44,8 @@ pub enum Action {
     /// Join a hidden network, named in the prompt.
     JoinOther,
     Disconnect,
+    /// Open the Network Settings panel.
+    OpenSettings,
 }
 
 /// A row's check box or radio button.
@@ -118,6 +120,8 @@ const MORE: i32 = 5;
 const ACTIONS_SEPARATOR: i32 = 6;
 const DISCONNECT: i32 = 7;
 const JOIN_OTHER: i32 = 8;
+const SETTINGS_SEPARATOR: i32 = 9;
+const SETTINGS: i32 = 10;
 /// Network ids start here, well clear of the fixed ones.
 const FIRST_NETWORK: i32 = 100;
 
@@ -207,6 +211,7 @@ pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
             action: Some(Action::Disconnect),
             ..Row::new(DISCONNECT, "Stop Hotspot")
         });
+        settings_rows(&mut root);
         return root;
     }
 
@@ -231,6 +236,7 @@ pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
         ..Row::new(WIRELESS, "Wireless Enabled")
     });
     if !on {
+        settings_rows(&mut root);
         return root;
     }
 
@@ -292,7 +298,17 @@ pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
             ..Row::new(DISCONNECT, "Disconnect")
         });
     }
+    settings_rows(&mut root);
     root
+}
+
+/// The way to the panel, at the foot of every menu that has a Wi-Fi device to talk about.
+fn settings_rows(root: &mut Row) {
+    root.children.push(Row::separator(SETTINGS_SEPARATOR));
+    root.children.push(Row {
+        action: Some(Action::OpenSettings),
+        ..Row::new(SETTINGS, "Network Settings...")
+    });
 }
 
 #[cfg(test)]
@@ -370,6 +386,8 @@ mod tests {
                 "",
                 "Join Other Network...",
                 "Disconnect",
+                "",
+                "Network Settings...",
             ]
         );
         assert!(!menu.children[0].enabled, "the heading cannot be chosen");
@@ -408,7 +426,10 @@ mod tests {
         let mut off = snapshot(DeviceState::Unavailable, None, vec![network("x", 50, true)]);
         off.wireless_enabled = false;
         let menu = build(Some(&off), &mut Ids::default());
-        assert_eq!(labels(&menu), ["Wi-Fi: Off", "Wireless Enabled"]);
+        assert_eq!(
+            labels(&menu),
+            ["Wi-Fi: Off", "Wireless Enabled", "", "Network Settings..."]
+        );
         assert_eq!(menu.children[1].toggle, Some(Toggle::Check(false)));
         assert_eq!(menu.children[1].action, Some(Action::Wireless(true)));
 

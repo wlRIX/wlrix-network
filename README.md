@@ -8,8 +8,9 @@ with a password dialog -- and nothing at all on a machine with no wireless devic
 - **License:** GPL-3.0-or-later
 
 IRIX was a workstation operating system and never had to say which network it was on. This is one of the pieces that
-makes wlRIX usable on a laptop. Steps one to three of `_docs/wlrix-network-roadmap.md` in the workspace are done: the
-icon, the menu, and passwords. The Network Settings panel is the next step.
+makes wlRIX usable on a laptop. All four steps of `_docs/wlrix-network-roadmap.md` in the workspace are done: the
+icon, the menu, passwords, and the Network Settings panel (`wlrix-settings-network`, in `wlrix-apps`), which the menu's
+last row opens.
 
 ## What it is
 
@@ -82,7 +83,10 @@ Wi-Fi: Connected to HomeNet
 ( ) CoffeeShop    ▂   (open)
 More Networks            >
 -------------------------
+Join Other Network...
 Disconnect
+-------------------------
+Network Settings...
 ```
 
 - **Opening it scans**, at most every ten seconds, and networks the scan finds appear in the open menu.

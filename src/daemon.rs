@@ -490,6 +490,24 @@ impl Daemon {
                     return;
                 }
             }
+            Action::OpenSettings => {
+                // Started and left: the panel is a window of its own, and this daemon has no say
+                // in how long it stays open. The child is reaped by a thread so it never lingers
+                // as a zombie.
+                match std::process::Command::new(SETTINGS_PROGRAM).spawn() {
+                    Ok(mut child) => {
+                        std::thread::spawn(move || child.wait());
+                    }
+                    Err(err) => {
+                        eprintln!("wlrix-network: could not start {SETTINGS_PROGRAM}: {err}");
+                        self.notify(
+                            "Network Settings would not start",
+                            &format!("{err}. Is {SETTINGS_PROGRAM} installed?"),
+                        );
+                    }
+                }
+                return;
+            }
             Action::JoinOther => {
                 let device_path = device.path.clone();
                 if let Some((token, child)) = self.ask(&Request::Other) {
@@ -549,6 +567,9 @@ impl Daemon {
         indicator::view(self.snapshot.as_ref(), self.config.indicator)
     }
 }
+
+/// The Network Settings panel, from `wlrix-apps`.
+const SETTINGS_PROGRAM: &str = "wlrix-settings-network";
 
 /// How long any call this daemon makes may take before it is given up on.
 ///
