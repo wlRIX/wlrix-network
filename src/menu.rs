@@ -10,6 +10,7 @@
 //! ( ) CoffeeShop      ▂▄   (open)
 //! More Networks                 >    (past the first eight)
 //! ---------------------------------
+//! Join Other Network...
 //! Disconnect
 //! ```
 //!
@@ -26,12 +27,12 @@
 //!
 //! # What is not here yet
 //!
-//! "Join Other Network..." and "Network Settings..." come with the password prompt and the
-//! settings panel. A row that does nothing would be worse than no row.
+//! "Network Settings..." comes with the settings panel. A row that does nothing would be worse
+//! than no row.
 
 use std::collections::HashMap;
 
-use crate::nm::{DeviceState, Network, Snapshot};
+use crate::nm::{ApSecurity, DeviceState, Network, Snapshot};
 
 /// What choosing a row does.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,8 @@ pub enum Action {
     Wireless(bool),
     /// Join the network with this name.
     Join(String),
+    /// Join a hidden network, named in the prompt.
+    JoinOther,
     Disconnect,
 }
 
@@ -114,6 +117,7 @@ const NOTHING_FOUND: i32 = 4;
 const MORE: i32 = 5;
 const ACTIONS_SEPARATOR: i32 = 6;
 const DISCONNECT: i32 = 7;
+const JOIN_OTHER: i32 = 8;
 /// Network ids start here, well clear of the fixed ones.
 const FIRST_NETWORK: i32 = 100;
 
@@ -152,10 +156,10 @@ fn bars(strength: u8) -> &'static str {
 /// everything sent over it can be read by anyone nearby.
 fn network_row(network: &Network, connected: Option<&str>, ids: &mut Ids) -> Row {
     let mut label = format!("{}   {}", network.ssid, bars(network.strength));
-    if !network.secured {
-        label.push_str("   (open)");
-    } else if network.enterprise {
-        label.push_str("   (enterprise)");
+    match network.security {
+        ApSecurity::Open => label.push_str("   (open)"),
+        ApSecurity::Enterprise => label.push_str("   (enterprise)"),
+        _ => {}
     }
     Row {
         toggle: Some(Toggle::Radio(connected == Some(network.ssid.as_str()))),
@@ -274,11 +278,15 @@ pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
         root.children.push(more);
     }
 
+    root.children.push(Row::separator(ACTIONS_SEPARATOR));
+    root.children.push(Row {
+        action: Some(Action::JoinOther),
+        ..Row::new(JOIN_OTHER, "Join Other Network...")
+    });
     if matches!(
         device.state,
         DeviceState::Connected | DeviceState::Connecting
     ) {
-        root.children.push(Row::separator(ACTIONS_SEPARATOR));
         root.children.push(Row {
             action: Some(Action::Disconnect),
             ..Row::new(DISCONNECT, "Disconnect")
@@ -296,8 +304,11 @@ mod tests {
         Network {
             ssid: ssid.into(),
             strength,
-            secured,
-            enterprise: false,
+            security: if secured {
+                ApSecurity::WpaPsk
+            } else {
+                ApSecurity::Open
+            },
             path: format!("/ap/{ssid}"),
         }
     }
@@ -357,6 +368,7 @@ mod tests {
                 "Neighbor   ▂▄▆█",
                 "Cafe   ▂   (open)",
                 "",
+                "Join Other Network...",
                 "Disconnect",
             ]
         );

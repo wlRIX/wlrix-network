@@ -1,15 +1,15 @@
 # wlrix-network
 
 Network status for the wlRIX desktop: NetworkManager's Wi-Fi state, as an icon in `wlrix-tray`. Bars of signal while
-connected, a tooltip naming the network and its address, a menu of nearby networks to join, and nothing at all on a
-machine with no wireless device.
+connected, a tooltip naming the network and its address, a menu of nearby networks to join -- secured ones included,
+with a password dialog -- and nothing at all on a machine with no wireless device.
 
 - **Language:** Rust
 - **License:** GPL-3.0-or-later
 
 IRIX was a workstation operating system and never had to say which network it was on. This is one of the pieces that
-makes wlRIX usable on a laptop. Steps one and two of `_docs/wlrix-network-roadmap.md` in the workspace are done: the
-icon, and the menu. The password prompt and the Network Settings panel are later steps.
+makes wlRIX usable on a laptop. Steps one to three of `_docs/wlrix-network-roadmap.md` in the workspace are done: the
+icon, the menu, and passwords. The Network Settings panel is the next step.
 
 ## What it is
 
@@ -90,9 +90,11 @@ Disconnect
   One row per network name, however many access points broadcast it. Eight at the top; the rest under More Networks.
 - **Choosing a saved network** joins it through the device's own `AvailableConnections` -- NetworkManager's list of
   profiles that work on that device, so a hotspot's profile or one tied to another interface is never mistaken for a
-  way to join. **Choosing an open network** creates a connection for it. **A secured one not yet saved** posts a
-  notification instead, with the `nmcli` command to join it once: the password prompt is the next step, and without
-  it NetworkManager would only fail asking for a key. Enterprise networks likewise.
+  way to join. **Choosing an open network** creates a connection for it. **A secured one not yet saved** asks for its
+  password first and creates the connection only once there is one, so a Cancel leaves nothing behind. Enterprise
+  (802.1X) networks post a notification instead: they take a username and certificates, which belong in Network
+  Settings.
+- **Join Other Network...** asks for a hidden network's name, security and password, and joins it.
 - **Wireless Enabled** is the software radio switch, grayed out when the hardware switch is off. **Disconnect** takes
   the device off its network; on a machine sharing a hotspot it reads **Stop Hotspot**.
 - A refusal -- no permission, a profile NetworkManager will not use -- is a notification, since nothing else would ever
@@ -104,6 +106,42 @@ single one as a mnemonic.
 
 The menu is `com.canonical.dbusmenu` at `/MenuBar`, and all of it is served -- `GetGroupProperties`, `EventGroup` and the
 rest -- so it works from another desktop's tray as well.
+
+## Passwords
+
+**The dialog is `wlrix-network-prompt`**, an Avalonia application in `wlrix-apps` like the pinentry: one line of JSON
+in, one line out, and Cancel is an exit with nothing written. It checks a key's length before anything is tried (WPA
+takes 8 to 63 characters or 64 hex digits, WEP 5 or 13 characters or 10 or 26 hex digits), says so when the last key
+was refused, and its Join Other Network mode asks for the name and security too. `WLRIX_NETWORK_PROMPT` names another
+program to run instead, for testing a build that is not installed.
+
+**This daemon is NetworkManager's secret agent.** It registers with NetworkManager's agent manager -- again whenever
+NetworkManager restarts, which forgets every agent -- and answers `GetSecrets` for this user's connections: from the
+keyring when the key is kept there, otherwise by asking. A key that stopped working comes back as a `REQUEST_NEW`,
+which the dialog states rather than presenting the same empty field again. Every call to the agent is checked to come
+from the owner of `org.freedesktop.NetworkManager`: the object is on the system bus, and answering anyone would hand
+this user's saved passwords to any local process. (The system bus's own policy already refuses such calls; this is the
+second lock on the door.)
+
+**Where a new connection's password lives** is decided when the connection is created:
+
+| Keyring                                     | Connection                    | Password                                  |
+|---------------------------------------------|-------------------------------|-------------------------------------------|
+| something serves it, default collection unlocked | this user only (`user:<name>:`) | agent-owned, in the login keyring       |
+| absent, or locked                           | everyone on the machine       | in NetworkManager's system profile       |
+
+In a wlRIX session the first row is the usual one: gnome-keyring runs as a user unit and the greeter's PAM stack unlocks
+the login collection at login. A per-user connection comes up only once someone is logged in, which is the trade
+accepted for a laptop's Wi-Fi. Keyring items use NetworkManager's own schema (`org.freedesktop.NetworkManager.Connection`
+with `connection-uuid`, `setting-name` and `setting-key`), so a password saved from GNOME is found here and the other
+way round.
+
+**A wrong password leaves nothing behind.** A connection created here that has never connected is remembered as fresh;
+if NetworkManager asks for its key again and the person cancels, the connection is deleted rather than left for
+autoconnect to keep failing on.
+
+Every call this daemon makes times out after ten seconds, so a service that stops answering mid-call -- seen with a
+keyring daemon handing its name to another process -- costs a log line, not a frozen menu.
 
 ## How it stays current
 
@@ -141,8 +179,15 @@ $ nmcli device wifi hotspot ifname wlan1 con-name test-wpa ssid test_wpa passwor
 $ wlrix-network --status
 ```
 
-Shared mode's DHCP may not answer between virtual radios, leaving the client at "getting IP configuration"; giving the
-client's profile a static `10.42.0.x/24` address gets it to connected. Delete the test profiles afterwards.
+Shared mode's DHCP may not answer between virtual radios, leaving the client at "getting IP configuration" -- which is
+past authentication, so it is as far as a password test needs to go. Giving the client's profile a static
+`10.42.0.x/24` address gets it to connected. Delete the test profiles afterwards.
+
+Passwords can be tested without typing into a window: point `WLRIX_NETWORK_PROMPT` at a script that reads the request
+line and prints an answer, or exits 1 for Cancel. To test keyring storage without the real keyring, give the test
+session its own `XDG_RUNTIME_DIR` and `XDG_DATA_HOME` and start an unlocked one inside it --
+`echo -n test | gnome-keyring-daemon --unlock --components=secrets`. Without the separate runtime directory a keyring
+D-Bus starts on a private bus finds the real one through its control socket.
 
 The menu can be driven without a pointer: `busctl --user call <item name> /MenuBar com.canonical.dbusmenu GetLayout iias
 -- 0 -1 0` lists the rows, and `Event isvu <id> clicked i 0 0` chooses one. Run that on a private bus

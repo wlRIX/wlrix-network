@@ -9,17 +9,22 @@
 //! - [`nm`] reads NetworkManager on the system bus and says when it changes.
 //! - [`indicator`] turns what it read into an icon, a status and a tooltip. No bus; unit-tested.
 //! - [`menu`] builds the menu from what was read. No bus; unit-tested.
+//! - [`agent`] is NetworkManager's secret agent, [`prompt`] the password dialog it and the menu
+//!   put up, and [`keyring`] where a per-user connection's password is kept.
 //! - [`sni`] is the item on the session bus, and its registration with the tray; [`dbusmenu`]
 //!   serves the menu beside it.
 //! - [`daemon`] is the loop between them.
 
+pub mod agent;
 pub mod config;
 pub mod daemon;
 pub mod dbusmenu;
 pub mod indicator;
+pub mod keyring;
 pub mod menu;
 pub mod nm;
 pub mod pidfile;
+pub mod prompt;
 pub mod signals;
 pub mod sni;
 pub mod xdg;

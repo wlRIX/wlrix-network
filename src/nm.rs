@@ -26,6 +26,8 @@ use zbus::MatchRule;
 use zbus::message::Type;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
+use crate::prompt::Security;
+
 /// NetworkManager's bus name and root object.
 pub const NAME: &str = "org.freedesktop.NetworkManager";
 const ROOT: &str = "/org/freedesktop/NetworkManager";
@@ -41,9 +43,20 @@ const DBUS: &str = "org.freedesktop.DBus";
 const DEVICE_TYPE_WIFI: u32 = 2;
 /// `NM_802_11_AP_FLAGS_PRIVACY`: WEP, or a key of some kind.
 const AP_PRIVACY: u32 = 0x1;
-/// `NM_802_11_AP_SEC_KEY_MGMT_802_1X`: enterprise Wi-Fi, a username and a certificate rather than
-/// a password.
+/// `NM_802_11_AP_SEC_KEY_MGMT_*`: how an access point says what its keys are.
+const KEY_MGMT_PSK: u32 = 0x100;
+/// Enterprise Wi-Fi: a username and a certificate rather than a password.
 const KEY_MGMT_802_1X: u32 = 0x200;
+/// WPA3 Personal.
+const KEY_MGMT_SAE: u32 = 0x400;
+/// Enhanced Open: encrypted, but with no password -- and its transition mode.
+const KEY_MGMT_OWE: u32 = 0x800 | 0x1000;
+
+/// The agent manager, which a secret agent registers with.
+const AGENT_MANAGER_PATH: &str = "/org/freedesktop/NetworkManager/AgentManager";
+const AGENT_MANAGER: &str = "org.freedesktop.NetworkManager.AgentManager";
+/// What this daemon registers as. Reverse-DNS, as NetworkManager requires of an identifier.
+const AGENT_IDENTIFIER: &str = "com.wlrix.network";
 
 /// Where a device is, from `NMDeviceState`, folded into what the indicator distinguishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,11 +131,70 @@ pub struct AccessPoint {
 pub struct Network {
     pub ssid: String,
     pub strength: u8,
-    pub secured: bool,
-    /// 802.1X. Set up in Network Settings rather than from a menu.
-    pub enterprise: bool,
+    pub security: ApSecurity,
     /// The strongest access point's object, which is what NetworkManager is asked to join.
     pub path: String,
+}
+
+/// What it takes to join a network, from what its access points advertise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApSecurity {
+    Open,
+    /// Enhanced Open (OWE): encrypted, but anyone may join, so no password.
+    EnhancedOpen,
+    Wep,
+    WpaPsk,
+    Sae,
+    /// 802.1X. Set up in Network Settings rather than from a menu.
+    Enterprise,
+}
+
+impl ApSecurity {
+    /// Read the three flag words an access point carries.
+    ///
+    /// In order of preference, because one access point may offer several: a network offering
+    /// both WPA2 and WPA3 (transition mode) is joined as WPA2, which every driver can do, with the
+    /// same password. Enterprise wins over a password only when no password mode is offered.
+    fn from_flags(privacy: u32, wpa: u32, rsn: u32) -> Self {
+        let key_mgmt = wpa | rsn;
+        if key_mgmt & KEY_MGMT_PSK != 0 {
+            Self::WpaPsk
+        } else if key_mgmt & KEY_MGMT_SAE != 0 {
+            Self::Sae
+        } else if key_mgmt & KEY_MGMT_802_1X != 0 {
+            Self::Enterprise
+        } else if key_mgmt & KEY_MGMT_OWE != 0 {
+            Self::EnhancedOpen
+        } else if privacy & AP_PRIVACY != 0 {
+            Self::Wep
+        } else {
+            Self::Open
+        }
+    }
+
+    /// Whether joining takes a password typed into the prompt.
+    pub fn needs_password(self) -> bool {
+        self.prompt().is_some()
+    }
+
+    /// The security the prompt is asked about, for the kinds it can ask about.
+    pub fn prompt(self) -> Option<Security> {
+        match self {
+            Self::WpaPsk => Some(Security::WpaPsk),
+            Self::Sae => Some(Security::Sae),
+            Self::Wep => Some(Security::Wep),
+            Self::Open | Self::EnhancedOpen | Self::Enterprise => None,
+        }
+    }
+}
+
+/// Who may use a new connection, and so where its password lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Owner {
+    /// This user only, with the password in their keyring (agent-owned).
+    User(String),
+    /// Everyone on the machine, with the password in NetworkManager's own system profile.
+    Everyone,
 }
 
 /// A saved Wi-Fi connection -- a network NetworkManager knows how to join.
@@ -297,8 +369,7 @@ fn networks(scanned: &[(String, HashMap<String, OwnedValue>)]) -> Vec<Network> {
         let network = Network {
             ssid: point.ssid,
             strength: point.strength,
-            secured: point.secured,
-            enterprise: (flag("WpaFlags") | flag("RsnFlags")) & KEY_MGMT_802_1X != 0,
+            security: ApSecurity::from_flags(flag("Flags"), flag("WpaFlags"), flag("RsnFlags")),
             path: path.clone(),
         };
         match best.get(&network.ssid) {
@@ -396,25 +467,117 @@ pub fn activate(
     Ok(())
 }
 
-/// Join a network NetworkManager has no connection for, creating one.
+/// The settings for a connection to a network NetworkManager does not know yet.
 ///
-/// The settings are left empty and the access point is named: NetworkManager fills in the rest
-/// from what the access point advertises, which for an open network is everything. Where the new
-/// connection is stored, and who may use it, is decided with the password prompt in the next
-/// step -- until then NetworkManager's default, system-wide, applies.
+/// Everything a hidden network needs, since nothing can be filled in from a scan; for a visible
+/// one NetworkManager completes the rest from the access point named alongside. `password` is
+/// ignored when there is no `security`.
+///
+/// The owner decides two things together, because they only make sense together: who may use the
+/// connection (`connection.permissions`) and who stores its key (the secret's flags). A per-user
+/// connection's key is **agent-owned** -- flag 1 -- so NetworkManager never writes it to
+/// `/etc/NetworkManager/system-connections` and asks this daemon, which keeps it in the keyring,
+/// whenever it needs it.
+pub fn new_connection(
+    ssid: &str,
+    security: Option<Security>,
+    password: &str,
+    hidden: bool,
+    owner: &Owner,
+) -> HashMap<&'static str, HashMap<&'static str, OwnedValue>> {
+    let value = |v: Value| OwnedValue::try_from(v).expect("a plain value is ownable");
+    let mut connection = HashMap::from([
+        ("id", value(Value::from(ssid.to_owned()))),
+        ("type", value(Value::from("802-11-wireless"))),
+    ]);
+    if let Owner::User(name) = owner {
+        // `user:<name>:` -- the trailing colon is the field for a reserved part, and is how
+        // NetworkManager itself writes the property.
+        connection.insert(
+            "permissions",
+            value(Value::from(vec![format!("user:{name}:")])),
+        );
+    }
+    let mut wireless = HashMap::from([
+        ("ssid", value(Value::from(ssid.as_bytes().to_vec()))),
+        ("mode", value(Value::from("infrastructure"))),
+    ]);
+    if hidden {
+        wireless.insert("hidden", value(Value::from(true)));
+    }
+    let mut settings = HashMap::from([("connection", connection), ("802-11-wireless", wireless)]);
+    if let Some(security) = security
+        && let (Some(key), Some(flags)) = (security.secret_key(), security.flags_key())
+    {
+        let agent_owned: u32 = match owner {
+            Owner::User(_) => 1,
+            Owner::Everyone => 0,
+        };
+        let mut section = HashMap::from([
+            ("key-mgmt", value(Value::from(security.key_mgmt()))),
+            (key, value(Value::from(password.to_owned()))),
+            (flags, value(Value::from(agent_owned))),
+        ]);
+        if security == Security::Wep {
+            // Key type 1, a hex or ASCII key: the only kind the prompt accepts.
+            section.insert("wep-key-type", value(Value::from(1u32)));
+        }
+        settings.insert("802-11-wireless-security", section);
+    }
+    settings
+}
+
+/// Create a connection and start it, on `device`, at `access_point` -- `"/"` to let NetworkManager
+/// find it, which a hidden network needs. Returns the new connection's settings object.
 pub fn add_and_activate(
     connection: &zbus::blocking::Connection,
+    settings: &HashMap<&'static str, HashMap<&'static str, OwnedValue>>,
     device: &str,
     access_point: &str,
-) -> zbus::Result<()> {
+) -> zbus::Result<OwnedObjectPath> {
     let object = |path: &str| ObjectPath::try_from(path.to_owned()).map_err(zbus::Error::from);
-    let settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
-    connection.call_method(
+    let reply = connection.call_method(
         Some(NAME),
         ROOT,
         Some(NAME),
         "AddAndActivateConnection",
         &(settings, object(device)?, object(access_point)?),
+    )?;
+    let (path, _active): (OwnedObjectPath, OwnedObjectPath) = reply.body().deserialize()?;
+    Ok(path)
+}
+
+/// A saved connection's uuid and name, which is what the keyring files its secrets under.
+pub fn identity(connection: &zbus::blocking::Connection, path: &str) -> Option<(String, String)> {
+    let reply = connection
+        .call_method(
+            Some(NAME),
+            path,
+            Some(SETTINGS_CONNECTION),
+            "GetSettings",
+            &(),
+        )
+        .ok()?;
+    let settings: HashMap<String, HashMap<String, OwnedValue>> = reply.body().deserialize().ok()?;
+    let section = settings.get("connection")?;
+    Some((take(section, "uuid")?, take(section, "id")?))
+}
+
+/// Remove a saved connection.
+pub fn delete_connection(connection: &zbus::blocking::Connection, path: &str) -> zbus::Result<()> {
+    connection.call_method(Some(NAME), path, Some(SETTINGS_CONNECTION), "Delete", &())?;
+    Ok(())
+}
+
+/// Tell NetworkManager this process answers for the user's secrets. It has to be said again
+/// whenever NetworkManager restarts, which forgets every agent.
+pub fn register_agent(connection: &zbus::blocking::Connection) -> zbus::Result<()> {
+    connection.call_method(
+        Some(NAME),
+        AGENT_MANAGER_PATH,
+        Some(AGENT_MANAGER),
+        "Register",
+        &(AGENT_IDENTIFIER,),
     )?;
     Ok(())
 }
@@ -664,7 +827,7 @@ mod tests {
             scanned(b"Cafe", 55, 0, "/ap/2"),
             scanned(b"Mesh", 80, 0x188, "/ap/3"),
             scanned(b"", 99, 0, "/ap/4"),
-            scanned(b"Campus", 30, 0x200 | 0x100, "/ap/5"),
+            scanned(b"Campus", 30, 0x200, "/ap/5"),
         ]);
         let names: Vec<&str> = list.iter().map(|n| n.ssid.as_str()).collect();
         assert_eq!(
@@ -676,9 +839,99 @@ mod tests {
             list[0].path, "/ap/3",
             "the strongest access point stands for the network"
         );
-        assert!(list[0].secured && !list[0].enterprise);
-        assert!(!list[1].secured);
-        assert!(list[2].enterprise);
+        assert_eq!(list[0].security, ApSecurity::WpaPsk);
+        assert_eq!(list[1].security, ApSecurity::Open);
+        assert_eq!(list[2].security, ApSecurity::Enterprise);
+    }
+
+    #[test]
+    fn security_is_read_from_the_flags_in_order_of_preference() {
+        assert_eq!(ApSecurity::from_flags(0, 0, 0), ApSecurity::Open);
+        assert_eq!(ApSecurity::from_flags(1, 0, 0), ApSecurity::Wep);
+        assert_eq!(ApSecurity::from_flags(1, 0, 0x188), ApSecurity::WpaPsk);
+        assert_eq!(ApSecurity::from_flags(1, 0, 0x488), ApSecurity::Sae);
+        // Transition mode: WPA2 and WPA3 both offered. WPA2 works everywhere, same password.
+        assert_eq!(ApSecurity::from_flags(1, 0, 0x588), ApSecurity::WpaPsk);
+        assert_eq!(ApSecurity::from_flags(1, 0, 0x288), ApSecurity::Enterprise);
+        assert_eq!(
+            ApSecurity::from_flags(1, 0, 0x888),
+            ApSecurity::EnhancedOpen
+        );
+        assert!(!ApSecurity::EnhancedOpen.needs_password());
+        assert!(!ApSecurity::Enterprise.needs_password());
+    }
+
+    fn read<T: TryFrom<OwnedValue>>(
+        settings: &HashMap<&'static str, HashMap<&'static str, OwnedValue>>,
+        section: &str,
+        key: &str,
+    ) -> T {
+        match settings[section][key].try_clone().unwrap().try_into() {
+            Ok(value) => value,
+            Err(_) => panic!("{section}.{key} has the wrong type"),
+        }
+    }
+
+    #[test]
+    fn a_per_user_connection_keeps_its_key_out_of_the_system_profile() {
+        let settings = new_connection(
+            "HomeNet",
+            Some(Security::WpaPsk),
+            "secret pass",
+            false,
+            &Owner::User("alice".into()),
+        );
+        let permissions: Vec<String> = read(&settings, "connection", "permissions");
+        assert_eq!(permissions, ["user:alice:"]);
+        assert_eq!(
+            read::<String>(&settings, "802-11-wireless-security", "key-mgmt"),
+            "wpa-psk"
+        );
+        assert_eq!(
+            read::<String>(&settings, "802-11-wireless-security", "psk"),
+            "secret pass"
+        );
+        assert_eq!(
+            read::<u32>(&settings, "802-11-wireless-security", "psk-flags"),
+            1,
+            "agent-owned"
+        );
+        assert!(!settings["802-11-wireless"].contains_key("hidden"));
+
+        let shared = new_connection(
+            "HomeNet",
+            Some(Security::WpaPsk),
+            "x",
+            false,
+            &Owner::Everyone,
+        );
+        assert!(!shared["connection"].contains_key("permissions"));
+        assert_eq!(
+            read::<u32>(&shared, "802-11-wireless-security", "psk-flags"),
+            0,
+            "NetworkManager keeps it"
+        );
+    }
+
+    #[test]
+    fn a_hidden_or_open_network_gets_what_it_needs() {
+        let hidden = new_connection("Secret", None, "ignored", true, &Owner::Everyone);
+        assert!(read::<bool>(&hidden, "802-11-wireless", "hidden"));
+        assert!(
+            !hidden.contains_key("802-11-wireless-security"),
+            "open: no security at all"
+        );
+        assert_eq!(
+            read::<Vec<u8>>(&hidden, "802-11-wireless", "ssid"),
+            b"Secret"
+        );
+
+        let wep = new_connection("Old", Some(Security::Wep), "abcde", false, &Owner::Everyone);
+        assert_eq!(
+            read::<String>(&wep, "802-11-wireless-security", "key-mgmt"),
+            "none"
+        );
+        assert!(wep["802-11-wireless-security"].contains_key("wep-key0"));
     }
 
     #[test]

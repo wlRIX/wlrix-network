@@ -206,6 +206,9 @@ pub fn publish(
     let layout = Arc::new(Mutex::new(Layout { root, revision: 1 }));
     let connection = zbus::blocking::connection::Builder::session()
         .map_err(|err| format!("no session bus: {err}"))?
+        // See `crate::daemon::CALL_TIMEOUT`: the keyring and the notification daemon are called on
+        // this connection, from the main loop.
+        .method_timeout(crate::daemon::CALL_TIMEOUT)
         .serve_at(
             ITEM_PATH,
             Item {

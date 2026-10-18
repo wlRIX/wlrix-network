@@ -322,8 +322,7 @@ mod tests {
                 networks: vec![Network {
                     ssid: "my_net".into(),
                     strength: 90,
-                    secured: true,
-                    enterprise: false,
+                    security: crate::nm::ApSecurity::WpaPsk,
                     path: "/ap/1".into(),
                 }],
             }],
