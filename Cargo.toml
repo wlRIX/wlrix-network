@@ -1,0 +1,22 @@
+[package]
+name = "wlrix-network"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "wlRIX network status -- NetworkManager's Wi-Fi state as a StatusNotifierItem for wlrix-tray."
+repository = "https://github.com/wlRIX/wlrix-network"
+publish = false
+
+[dependencies]
+# The event loop. The NetworkManager watcher, the tray watcher and the SIGHUP/SIGTERM pings are
+# all sources on one loop, with a timer to let a burst of NetworkManager signals settle before the
+# state is read again. No Wayland: this program draws nothing -- `wlrix-tray` draws its icon.
+calloop = "0.13"
+# D-Bus, twice over: the system bus, where NetworkManager is, and the session bus, where the item
+# is served and the tray is. Blocking API and no tokio, as in every other wlRIX component.
+zbus = "5"
+# The config file.
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# `O_NOFOLLOW` on the pidfile and `signal` for the handlers.
+libc = "0.2"
