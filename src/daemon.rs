@@ -47,6 +47,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use crate::agent::{self, AgentError, AgentEvent, SecretRequest, Settings};
 use crate::config::Config;
 use crate::dbusmenu::MenuEvent;
+use crate::i18n::{Language, tr};
 use crate::indicator::{self, Status, View};
 use crate::keyring::Keyring;
 use crate::menu::{self, Action, Ids};
@@ -192,8 +193,14 @@ impl Daemon {
             Err(err) => {
                 eprintln!("wlrix-network: {err}");
                 self.notify(
-                    "The password prompt would not start",
-                    &format!("{err}. Is wlrix-network-prompt installed?"),
+                    tr(
+                        "The password prompt would not start",
+                        "パスワードの入力画面を開けませんでした",
+                    ),
+                    &Language::current().pick(
+                        format!("{err}. Is wlrix-network-prompt installed?"),
+                        format!("{err}。wlrix-network-prompt はインストールされていますか?"),
+                    ),
                 );
                 None
             }
@@ -387,7 +394,7 @@ impl Daemon {
             }
             Err(err) => {
                 eprintln!("wlrix-network: joining {} failed: {err}", answer.ssid);
-                self.notify("Network change failed", &refusal(&err));
+                self.notify(change_failed(), &refusal(&err));
             }
         }
     }
@@ -501,8 +508,14 @@ impl Daemon {
                     Err(err) => {
                         eprintln!("wlrix-network: could not start {SETTINGS_PROGRAM}: {err}");
                         self.notify(
-                            "Network Settings would not start",
-                            &format!("{err}. Is {SETTINGS_PROGRAM} installed?"),
+                            tr(
+                                "Network Settings would not start",
+                                "ネットワーク設定を開けませんでした",
+                            ),
+                            &Language::current().pick(
+                                format!("{err}. Is {SETTINGS_PROGRAM} installed?"),
+                                format!("{err}。{SETTINGS_PROGRAM} はインストールされていますか?"),
+                            ),
                         );
                     }
                 }
@@ -524,7 +537,7 @@ impl Daemon {
         };
         if let Err(err) = result {
             eprintln!("wlrix-network: {action:?} failed: {err}");
-            self.notify("Network change failed", &refusal(&err));
+            self.notify(change_failed(), &refusal(&err));
         }
     }
 
@@ -539,7 +552,7 @@ impl Daemon {
             Some("org.freedesktop.Notifications"),
             "Notify",
             &(
-                "Network",
+                tr("Network", "ネットワーク"),
                 0u32,
                 "network-wireless-symbolic",
                 summary,
@@ -768,6 +781,14 @@ pub fn status() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The summary of a notification saying NetworkManager refused something.
+fn change_failed() -> &'static str {
+    tr(
+        "Network change failed",
+        "ネットワークを変更できませんでした",
+    )
 }
 
 /// What NetworkManager said when it refused, without the D-Bus error name in front -- "Not

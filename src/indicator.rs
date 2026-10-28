@@ -21,6 +21,7 @@
 //! wired indicator: a machine on a cable shows nothing, which is what a desktop wants.
 
 use crate::config::Indicator;
+use crate::i18n::{Language, tr};
 use crate::nm::{Connectivity, DeviceState, Mode, Snapshot};
 
 /// `Status`, as the StatusNotifierItem specification spells it.
@@ -81,15 +82,19 @@ pub fn view(snapshot: Option<&Snapshot>, setting: Indicator) -> View {
         body: String::new(),
     };
     let Some(snapshot) = snapshot else {
-        return hidden("NetworkManager is not running");
+        return hidden(tr(
+            "NetworkManager is not running",
+            "NetworkManager が実行されていません",
+        ));
     };
     let Some(device) = snapshot.primary() else {
-        return hidden("No wireless device");
+        return hidden(tr("No wireless device", "ワイヤレスデバイスがありません"));
     };
     let status = match setting {
         Indicator::Auto => Status::Active,
         Indicator::Hidden => Status::Passive,
     };
+    let wireless_off = tr("Wireless is off", "ワイヤレスはオフです");
     let view = |icon, title: String, body: Vec<String>| View {
         status,
         icon,
@@ -102,12 +107,18 @@ pub fn view(snapshot: Option<&Snapshot>, setting: Indicator) -> View {
     if !snapshot.hardware_enabled {
         return view(
             HARDWARE_DISABLED,
-            "Wireless is off".into(),
-            vec!["Turned off by the hardware switch".into()],
+            wireless_off.into(),
+            vec![
+                tr(
+                    "Turned off by the hardware switch",
+                    "ハードウェアスイッチでオフになっています",
+                )
+                .into(),
+            ],
         );
     }
     if !snapshot.wireless_enabled {
-        return view(DISABLED, "Wireless is off".into(), Vec::new());
+        return view(DISABLED, wireless_off.into(), Vec::new());
     }
 
     let ssid = device.access_point.as_ref().map(|ap| ap.ssid.clone());
@@ -115,33 +126,54 @@ pub fn view(snapshot: Option<&Snapshot>, setting: Indicator) -> View {
         return view(
             HOTSPOT,
             match ssid {
-                Some(ssid) => format!("Hotspot: {ssid}"),
-                None => "Hotspot".into(),
+                Some(ssid) => format!("{}: {ssid}", tr("Hotspot", "ホットスポット")),
+                None => tr("Hotspot", "ホットスポット").into(),
             },
-            vec!["Sharing this computer's connection".into()],
+            vec![
+                tr(
+                    "Sharing this computer's connection",
+                    "このコンピュータの接続を共有しています",
+                )
+                .into(),
+            ],
         );
     }
     match device.state {
         DeviceState::Connected => {
             let Some(ap) = device.access_point.as_ref() else {
                 // Connected with no access point is a moment in the middle of roaming.
-                return view(ACQUIRING, "Wi-Fi".into(), vec!["Connected".into()]);
+                return view(
+                    ACQUIRING,
+                    "Wi-Fi".into(),
+                    vec![tr("Connected", "接続済み").into()],
+                );
             };
-            let mut body = vec![format!(
-                "Signal {}%{}",
-                ap.strength,
-                if ap.secured { ", secured" } else { ", open" }
+            let mut body = vec![Language::current().pick(
+                format!(
+                    "Signal {}%{}",
+                    ap.strength,
+                    if ap.secured { ", secured" } else { ", open" }
+                ),
+                format!(
+                    "信号 {}%、{}",
+                    ap.strength,
+                    if ap.secured {
+                        "保護あり"
+                    } else {
+                        "保護なし"
+                    }
+                ),
             )];
             if let Some(address) = &device.ipv4 {
                 body.push(address.clone());
             }
             let icon = match snapshot.connectivity {
                 Connectivity::None | Connectivity::Limited => {
-                    body.push("No internet access".into());
+                    body.push(tr("No internet access", "インターネットに接続できません").into());
                     NO_ROUTE
                 }
                 Connectivity::Portal => {
-                    body.push("Sign-in required".into());
+                    body.push(tr("Sign-in required", "サインインが必要です").into());
                     NO_ROUTE
                 }
                 Connectivity::Full | Connectivity::Unknown => signal(ap.strength),
@@ -151,15 +183,28 @@ pub fn view(snapshot: Option<&Snapshot>, setting: Indicator) -> View {
         DeviceState::Connecting => view(
             ACQUIRING,
             match ssid {
-                Some(ssid) => format!("Connecting to {ssid}"),
-                None => "Connecting".into(),
+                Some(ssid) => Language::current()
+                    .pick(format!("Connecting to {ssid}"), format!("{ssid} に接続中")),
+                None => tr("Connecting", "接続中").into(),
             },
             Vec::new(),
         ),
-        DeviceState::Disconnecting => view(OFFLINE, "Disconnecting".into(), Vec::new()),
-        DeviceState::Failed => view(OFFLINE, "Connection failed".into(), Vec::new()),
-        DeviceState::Disconnected => view(OFFLINE, "Not connected".into(), Vec::new()),
-        DeviceState::Unavailable => view(OFFLINE, "Wireless unavailable".into(), Vec::new()),
+        DeviceState::Disconnecting => {
+            view(OFFLINE, tr("Disconnecting", "切断中").into(), Vec::new())
+        }
+        DeviceState::Failed => view(
+            OFFLINE,
+            tr("Connection failed", "接続に失敗しました").into(),
+            Vec::new(),
+        ),
+        DeviceState::Disconnected => {
+            view(OFFLINE, tr("Not connected", "未接続").into(), Vec::new())
+        }
+        DeviceState::Unavailable => view(
+            OFFLINE,
+            tr("Wireless unavailable", "ワイヤレスを利用できません").into(),
+            Vec::new(),
+        ),
     }
 }
 

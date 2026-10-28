@@ -19,6 +19,7 @@ pub mod agent;
 pub mod config;
 pub mod daemon;
 pub mod dbusmenu;
+pub mod i18n;
 pub mod indicator;
 pub mod keyring;
 pub mod menu;

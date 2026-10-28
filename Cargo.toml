@@ -1,6 +1,6 @@
 [package]
 name = "wlrix-network"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "wlRIX network status -- NetworkManager's Wi-Fi state as a StatusNotifierItem for wlrix-tray."

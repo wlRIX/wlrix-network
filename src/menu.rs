@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 
+use crate::i18n::{Language, tr};
 use crate::nm::{ApSecurity, DeviceState, Network, Snapshot};
 
 /// What choosing a row does.
@@ -161,8 +162,8 @@ fn bars(strength: u8) -> &'static str {
 fn network_row(network: &Network, connected: Option<&str>, ids: &mut Ids) -> Row {
     let mut label = format!("{}   {}", network.ssid, bars(network.strength));
     match network.security {
-        ApSecurity::Open => label.push_str("   (open)"),
-        ApSecurity::Enterprise => label.push_str("   (enterprise)"),
+        ApSecurity::Open => label.push_str(tr("   (open)", "   (保護なし)")),
+        ApSecurity::Enterprise => label.push_str(tr("   (enterprise)", "   (エンタープライズ)")),
         _ => {}
     }
     Row {
@@ -176,13 +177,20 @@ fn network_row(network: &Network, connected: Option<&str>, ids: &mut Ids) -> Row
 pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
     let mut root = Row::new(0, "");
     let Some(snapshot) = snapshot else {
-        root.children
-            .push(Row::heading(HEADING, "NetworkManager is not running"));
+        root.children.push(Row::heading(
+            HEADING,
+            tr(
+                "NetworkManager is not running",
+                "NetworkManager が実行されていません",
+            ),
+        ));
         return root;
     };
     let Some(device) = snapshot.primary() else {
-        root.children
-            .push(Row::heading(HEADING, "No wireless device"));
+        root.children.push(Row::heading(
+            HEADING,
+            tr("No wireless device", "ワイヤレスデバイスがありません"),
+        ));
         return root;
     };
     let on = snapshot.wireless_enabled && snapshot.hardware_enabled;
@@ -198,33 +206,48 @@ pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
         // switch stays, and Disconnect is how a hotspot is stopped.
         root.children.push(Row::heading(
             HEADING,
-            format!("Wi-Fi: Hotspot {}", connected.unwrap_or_default()),
+            format!(
+                "Wi-Fi: {} {}",
+                tr("Hotspot", "ホットスポット"),
+                connected.unwrap_or_default()
+            ),
         ));
         root.children.push(Row {
             toggle: Some(Toggle::Check(on)),
             action: Some(Action::Wireless(!snapshot.wireless_enabled)),
             enabled: snapshot.hardware_enabled,
-            ..Row::new(WIRELESS, "Wireless Enabled")
+            ..Row::new(WIRELESS, wireless_enabled())
         });
         root.children.push(Row::separator(ACTIONS_SEPARATOR));
         root.children.push(Row {
             action: Some(Action::Disconnect),
-            ..Row::new(DISCONNECT, "Stop Hotspot")
+            ..Row::new(DISCONNECT, tr("Stop Hotspot", "ホットスポットを停止"))
         });
         settings_rows(&mut root);
         return root;
     }
 
+    let language = Language::current();
     let heading = if !snapshot.hardware_enabled {
-        "Wi-Fi: Off at the hardware switch".to_owned()
+        tr(
+            "Wi-Fi: Off at the hardware switch",
+            "Wi-Fi: ハードウェアスイッチでオフ",
+        )
+        .to_owned()
     } else if !on {
-        "Wi-Fi: Off".to_owned()
+        tr("Wi-Fi: Off", "Wi-Fi: オフ").to_owned()
     } else {
         match (device.state, connected) {
-            (DeviceState::Connected, Some(ssid)) => format!("Wi-Fi: Connected to {ssid}"),
-            (DeviceState::Connecting, Some(ssid)) => format!("Wi-Fi: Connecting to {ssid}"),
-            (DeviceState::Connecting, None) => "Wi-Fi: Connecting".to_owned(),
-            _ => "Wi-Fi: Not connected".to_owned(),
+            (DeviceState::Connected, Some(ssid)) => language.pick(
+                format!("Wi-Fi: Connected to {ssid}"),
+                format!("Wi-Fi: {ssid} に接続済み"),
+            ),
+            (DeviceState::Connecting, Some(ssid)) => language.pick(
+                format!("Wi-Fi: Connecting to {ssid}"),
+                format!("Wi-Fi: {ssid} に接続中"),
+            ),
+            (DeviceState::Connecting, None) => tr("Wi-Fi: Connecting", "Wi-Fi: 接続中").to_owned(),
+            _ => tr("Wi-Fi: Not connected", "Wi-Fi: 未接続").to_owned(),
         }
     };
     root.children.push(Row::heading(HEADING, heading));
@@ -233,7 +256,7 @@ pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
         action: Some(Action::Wireless(!snapshot.wireless_enabled)),
         // The software switch cannot overrule the hardware one, so offering it would be a lie.
         enabled: snapshot.hardware_enabled,
-        ..Row::new(WIRELESS, "Wireless Enabled")
+        ..Row::new(WIRELESS, wireless_enabled())
     });
     if !on {
         settings_rows(&mut root);
@@ -268,15 +291,17 @@ pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
     ordered.truncate(MOST);
 
     if ordered.is_empty() {
-        root.children
-            .push(Row::heading(NOTHING_FOUND, "No networks found"));
+        root.children.push(Row::heading(
+            NOTHING_FOUND,
+            tr("No networks found", "ネットワークが見つかりません"),
+        ));
     }
     let (top, rest) = ordered.split_at(ordered.len().min(TOP_LEVEL));
     for network in top {
         root.children.push(network_row(network, connected, ids));
     }
     if !rest.is_empty() {
-        let mut more = Row::new(MORE, "More Networks");
+        let mut more = Row::new(MORE, tr("More Networks", "その他のネットワーク"));
         more.children = rest
             .iter()
             .map(|network| network_row(network, connected, ids))
@@ -287,7 +312,10 @@ pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
     root.children.push(Row::separator(ACTIONS_SEPARATOR));
     root.children.push(Row {
         action: Some(Action::JoinOther),
-        ..Row::new(JOIN_OTHER, "Join Other Network...")
+        ..Row::new(
+            JOIN_OTHER,
+            tr("Join Other Network...", "その他のネットワークに接続..."),
+        )
     });
     if matches!(
         device.state,
@@ -295,11 +323,16 @@ pub fn build(snapshot: Option<&Snapshot>, ids: &mut Ids) -> Row {
     ) {
         root.children.push(Row {
             action: Some(Action::Disconnect),
-            ..Row::new(DISCONNECT, "Disconnect")
+            ..Row::new(DISCONNECT, tr("Disconnect", "切断"))
         });
     }
     settings_rows(&mut root);
     root
+}
+
+/// The label of the radio's on/off switch, which every menu with a device in it has.
+fn wireless_enabled() -> &'static str {
+    tr("Wireless Enabled", "ワイヤレスを有効にする")
 }
 
 /// The way to the panel, at the foot of every menu that has a Wi-Fi device to talk about.
@@ -307,7 +340,7 @@ fn settings_rows(root: &mut Row) {
     root.children.push(Row::separator(SETTINGS_SEPARATOR));
     root.children.push(Row {
         action: Some(Action::OpenSettings),
-        ..Row::new(SETTINGS, "Network Settings...")
+        ..Row::new(SETTINGS, tr("Network Settings...", "ネットワーク設定..."))
     });
 }
 
